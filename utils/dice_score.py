@@ -6,14 +6,12 @@ import logging
 def dice_coeff(input: Tensor, target: Tensor, reduce_batch_first: bool = False, epsilon: float = 1e-8):
     """
     计算Dice系数，改进的数值稳定性版本
-    
-    关键改进：
-    1. epsilon从1e-6增加到1e-8，提高数值稳定性
-    2. 添加NaN/Inf检查
-    3. 使用更稳定的计算方式
+
+    支持 2D 与 3D（乃至更高维）输入：
+    - 当 reduce_batch_first=True 时，视第0维为批次维度，按除第0维以外的所有维度进行求和
+    - 当 reduce_batch_first=False 时，对所有维度进行求和（用于无batch情形）
     """
-    assert input.size() == target.size()
-    assert input.dim() == 3 or not reduce_batch_first
+    assert input.size() == target.size(), "input and target must have the same shape"
 
     # 检查输入是否包含NaN/Inf
     if torch.isnan(input).any() or torch.isinf(input).any():
@@ -23,44 +21,53 @@ def dice_coeff(input: Tensor, target: Tensor, reduce_batch_first: bool = False, 
         logging.warning('dice_coeff: target contains NaN/Inf')
         return torch.tensor(0.0, device=input.device, dtype=input.dtype)
 
-    sum_dim = (-1, -2) if input.dim() == 2 or not reduce_batch_first else (-1, -2, -3)
+    # 按维度自适应计算维度集合
+    # reduce_batch_first=True: 保留第0维(batch)，对其余维度求和
+    # reduce_batch_first=False: 对所有维度求和
+    if input.dim() == 0:
+        logging.warning('dice_coeff: input has zero dims')
+        return torch.tensor(0.0, device=input.device, dtype=input.dtype)
+
+    if reduce_batch_first:
+        if input.dim() < 2:
+            logging.warning('dice_coeff: input dim too small for reduce_batch_first')
+            return torch.tensor(0.0, device=input.device, dtype=input.dtype)
+        sum_dim = tuple(range(1, input.dim()))
+    else:
+        sum_dim = tuple(range(0, input.dim()))
 
     # 计算交集和并集
     inter = 2 * (input * target).sum(dim=sum_dim)
     sets_sum = input.sum(dim=sum_dim) + target.sum(dim=sum_dim)
-    
-    # 处理空集情况（都是背景的情况）
-    # 如果sets_sum为0且inter也为0，表示都是背景，应该返回dice=1（完全匹配）
-    # 使用torch.where确保正确处理这种情况
+
+    # 处理空集情况
     sets_sum = torch.where(sets_sum == 0, inter + epsilon, sets_sum)
-    
-    # 更稳定的dice计算：使用更大的epsilon
+
     dice = (inter + epsilon) / (sets_sum + epsilon)
-    
-    # 确保dice值在有效范围内 [0, 1]
     dice = torch.clamp(dice, min=0.0, max=1.0)
-    
-    # 检查结果是否为NaN/Inf
+
     if torch.isnan(dice).any() or torch.isinf(dice).any():
         logging.warning('dice_coeff: result contains NaN/Inf, returning 0')
         return torch.tensor(0.0, device=input.device, dtype=input.dtype)
-    
+
     return dice.mean()
 
 
 def multiclass_dice_coeff(input: Tensor, target: Tensor, reduce_batch_first: bool = False, epsilon: float = 1e-8):
     """
-    多类别Dice系数，改进的数值稳定性版本
+    多类别Dice系数，改进的数值稳定性版本。
+    兼容 2D/3D：调用 dice_coeff 时自动按维度聚合。
     """
-    # 检查输入维度
-    if input.dim() < 3 or target.dim() < 3:
-        logging.warning('multiclass_dice_coeff: input/target dimensions too small')
-        return torch.tensor(0.0, device=input.device, dtype=input.dtype)
-    
-    # 使用更稳定的方式：先检查每个类别，然后平均
+    # 使用更稳定的方式：先把 (B, C, ...) 展平为 (B*C, ...)，再对除第0维外的所有维度求和
     try:
-        result = dice_coeff(input.flatten(0, 1), target.flatten(0, 1), reduce_batch_first, epsilon)
-        # 确保结果有效
+        # 确保输入至少有通道维
+        if input.dim() < 3:
+            logging.warning('multiclass_dice_coeff: input/target dimensions too small')
+            return torch.tensor(0.0, device=input.device, dtype=input.dtype)
+
+        flattened_input = input.flatten(0, 1)
+        flattened_target = target.flatten(0, 1)
+        result = dice_coeff(flattened_input, flattened_target, reduce_batch_first=True, epsilon=epsilon)
         if torch.isnan(result) or torch.isinf(result):
             return torch.tensor(0.0, device=input.device, dtype=input.dtype)
         return result
@@ -72,27 +79,18 @@ def multiclass_dice_coeff(input: Tensor, target: Tensor, reduce_batch_first: boo
 def dice_loss(input: Tensor, target: Tensor, multiclass: bool = False, epsilon: float = 1e-8):
     """
     Dice损失函数，改进的数值稳定性版本
-    
-    关键改进：
-    1. 增加epsilon参数，默认使用更大的值（1e-8）
-    2. 添加NaN/Inf检查和保护
-    3. 确保返回值在有效范围内
     """
     try:
         fn = multiclass_dice_coeff if multiclass else dice_coeff
         dice = fn(input, target, reduce_batch_first=True, epsilon=epsilon)
-        
-        # 计算loss
+
         loss = 1 - dice
-        
-        # 确保loss在有效范围内 [0, 1]
         loss = torch.clamp(loss, min=0.0, max=1.0)
-        
-        # 最终检查
+
         if torch.isnan(loss) or torch.isinf(loss):
             logging.warning('dice_loss: result is NaN/Inf, returning 1.0 (maximum loss)')
             return torch.tensor(1.0, device=input.device, dtype=input.dtype)
-        
+
         return loss
     except Exception as e:
         logging.warning(f'dice_loss error: {e}, returning 1.0 (maximum loss)')

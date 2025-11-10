@@ -13,7 +13,7 @@ from typing import Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -108,7 +108,7 @@ def train_one_epoch(
         masks = remap_labels(masks)
 
         optimizer.zero_grad(set_to_none=True)
-        with autocast(enabled=amp_enabled):
+        with autocast(device_type=device.type, enabled=amp_enabled):
             outputs = model(images)
             losses = compute_loss(outputs, masks, criterion, n_classes)
 
@@ -153,7 +153,7 @@ def evaluate(model, loader, criterion, device, n_classes, amp_enabled, return_sa
         masks = batch["mask"].to(device, non_blocking=True)
         masks = remap_labels(masks)
 
-        with autocast(enabled=amp_enabled):
+        with autocast(device_type=device.type, enabled=amp_enabled):
             outputs = model(images)
             losses = compute_loss(outputs, masks, criterion, n_classes)
 
@@ -191,7 +191,11 @@ def main(args):
     model = UNet3D(n_channels=4, n_classes=4, base_channels=32, bilinear=False).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     criterion = nn.CrossEntropyLoss()
-    scaler = GradScaler(enabled=args.amp)
+    amp_enabled = args.amp and device.type == "cuda"
+    if device.type == "cuda":
+        scaler = GradScaler("cuda", enabled=amp_enabled)
+    else:
+        scaler = GradScaler(enabled=False)
 
     best_val_dice = 0.0
     global_step = 0
@@ -209,7 +213,7 @@ def main(args):
             criterion=criterion,
             device=device,
             n_classes=4,
-            amp_enabled=args.amp,
+            amp_enabled=amp_enabled,
             log_interval=args.log_interval,
             grad_clip=args.grad_clip,
             use_wandb=use_wandb,
@@ -236,7 +240,7 @@ def main(args):
             criterion=criterion,
             device=device,
             n_classes=4,
-            amp_enabled=args.amp,
+            amp_enabled=amp_enabled,
             return_sample=True,
         )
 

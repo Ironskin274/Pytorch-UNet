@@ -45,14 +45,11 @@ class Up3D(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, bilinear: bool = False):
         super().__init__()
         if bilinear:
-            self.up = nn.Sequential(
-                nn.Upsample(scale_factor=2, mode="trilinear", align_corners=True),
-                nn.Conv3d(in_channels // 2, in_channels // 2, kernel_size=1),
-            )
+            self.up = nn.Upsample(scale_factor=2, mode="trilinear", align_corners=True)
+            self.conv = DoubleConv3D(in_channels, out_channels, in_channels // 2)
         else:
-            self.up = nn.ConvTranspose3d(in_channels // 2, in_channels // 2, kernel_size=2, stride=2)
-
-        self.conv = DoubleConv3D(in_channels, out_channels)
+            self.up = nn.ConvTranspose3d(in_channels, in_channels // 2, kernel_size=2, stride=2)
+            self.conv = DoubleConv3D(in_channels, out_channels)
 
     def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
         x1 = self.up(x1)
