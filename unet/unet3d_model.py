@@ -162,3 +162,4 @@ class UNet3D(nn.Module):
         self.up3 = torch.utils.checkpoint.checkpoint_sequential(self.up3, segments=1)
         self.up4 = torch.utils.checkpoint.checkpoint_sequential(self.up4, segments=1)
         self.outc = torch.utils.checkpoint.checkpoint_sequential(self.outc, segments=1)
+

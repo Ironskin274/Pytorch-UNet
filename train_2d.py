@@ -17,6 +17,7 @@ from unet import UNet
 from utils.data_loading_2d import BraTS2020Dataset
 from utils.metrics import compute_metrics, remap_labels
 from utils.visualization import create_segmentation_visualization
+from utils.class_weights import load_class_weights, print_weights_info
 
 # BraTS2020数据集路径
 dir_brats_train = '/data/ssd2/liying/Datasets/BraTS2020/MICCAI_BraTS2020_TrainingData/'
@@ -165,6 +166,8 @@ def train_model(
         img_scale: float = 1.0,
         use_wandb: bool = True,
         log_interval: int = 50,
+        class_weights_file: str = None,
+        weight_method: str = 'effective_num_0.999',
 ):
     # 1. Create dataset
     logging.info('Using BraTS2020 2D dataset (slices)')
@@ -229,7 +232,15 @@ def train_model(
 
     # 4. Set up the optimizer and loss (refractor style)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = nn.CrossEntropyLoss()
+    
+    # 加载类别权重（如果指定）
+    class_weights_tensor = load_class_weights(class_weights_file, weight_method, device=device)
+    if class_weights_tensor is not None:
+        criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
+        logging.info(f'✓ 使用加权CrossEntropyLoss，权重方法: {weight_method}')
+    else:
+        criterion = nn.CrossEntropyLoss()
+        logging.info('使用标准CrossEntropyLoss（无加权）')
     
     best_val_loss = float('inf')
     best_dice_wt = 0.0
@@ -365,6 +376,10 @@ def get_args():
     parser.add_argument('--no-wandb', action='store_true', default=False, help='Disable wandb logging')
     parser.add_argument('--log-interval', type=int, default=50, dest='log_interval',
                         help='每N个batch记录一次训练loss到wandb（默认: 50）')
+    parser.add_argument('--class-weights', type=str, default=None, dest='class_weights',
+                        help='类别权重文件路径（JSON格式），用于处理类别不平衡')
+    parser.add_argument('--weight-method', type=str, default='effective_num_0.999',
+                        help='权重方法名称（默认: effective_num_0.999）')
 
     return parser.parse_args()
 
@@ -397,6 +412,11 @@ if __name__ == '__main__':
         logging.info(f'Model loaded from {args.load}')
 
     model.to(device=device)
+    
+    # 打印类别权重信息（如果指定）
+    if args.class_weights:
+        print_weights_info(args.class_weights)
+    
     try:
         train_model(
             model=model,
@@ -407,6 +427,8 @@ if __name__ == '__main__':
             img_scale=args.scale,
             use_wandb=not args.no_wandb,
             log_interval=args.log_interval,
+            class_weights_file=args.class_weights,
+            weight_method=args.weight_method,
         )
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '
@@ -422,5 +444,7 @@ if __name__ == '__main__':
             img_scale=args.scale,
             use_wandb=not args.no_wandb,
             log_interval=args.log_interval,
+            class_weights_file=args.class_weights,
+            weight_method=args.weight_method,
         )
 

@@ -23,6 +23,8 @@ from unet import UNet3D
 from utils.data_loading_3d import BraTS2020Dataset3D
 from utils.metrics import compute_metrics, remap_labels
 from utils.dice_score import dice_loss
+from utils.visualization import create_segmentation_visualization
+from utils.class_weights import load_class_weights, print_weights_info
 
 
 DEFAULT_DATA_DIR = "/data/ssd2/liying/Datasets/BraTS2020/MICCAI_BraTS2020_TrainingData/"
@@ -47,11 +49,18 @@ def parse_args():
     parser.add_argument("--target-shape", type=int, nargs=3, default=(128, 128, 128), help="裁剪/填充后的体积大小")
     parser.add_argument("--num-workers", type=int, default=4, help="数据加载线程数")
 
+    parser.add_argument("--modalities", type=str, nargs="+", default=["flair", "t1ce", "t2"], help="使用的模态列表，例如 flair t1ce t2")
+    parser.add_argument("--fg-min-ratio", type=float, default=0.01, help="前景体素最小比例过滤")
+    parser.add_argument("--jitter-ratio", type=float, default=0.1, help="bbox中心抖动比例(相对target_shape)")
+
     parser.add_argument("--device", type=str, default="cuda", help="训练设备")
     parser.add_argument("--amp", action="store_true", default=False, help="启用自动混合精度训练")
     parser.add_argument("--no-wandb", action="store_true", default=False, help="禁用 wandb 日志")
     parser.add_argument("--project", type=str, default="BraTS2020-UNet-3D", help="wandb 项目名称")
     parser.add_argument("--run-name", type=str, default=None, help="wandb 运行名称")
+    
+    parser.add_argument("--class-weights", type=str, default=None, help="类别权重文件路径（JSON格式），用于处理类别不平衡")
+    parser.add_argument("--weight-method", type=str, default="effective_num_0.999", help="权重方法名称（默认: effective_num_0.999）")
 
     return parser.parse_args()
 
@@ -60,12 +69,18 @@ def prepare_dataloaders(args):
     train_set = BraTS2020Dataset3D(
         data_dir=args.data_dir,
         list_file=args.train_list,
+        modalities=args.modalities,
         target_shape=tuple(args.target_shape),
+        fg_min_ratio=args.fg_min_ratio,
+        jitter_ratio=args.jitter_ratio,
     )
     val_set = BraTS2020Dataset3D(
         data_dir=args.data_dir,
         list_file=args.valid_list,
+        modalities=args.modalities,
         target_shape=tuple(args.target_shape),
+        fg_min_ratio=args.fg_min_ratio,
+        jitter_ratio=0.0,  # 验证不抖动
     )
 
     loader_args = dict(batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True)
@@ -74,12 +89,13 @@ def prepare_dataloaders(args):
     return train_loader, val_loader
 
 
-def compute_loss(outputs: torch.Tensor, targets: torch.Tensor, criterion: nn.Module, n_classes: int) -> Dict[str, torch.Tensor]:
+def compute_loss(outputs: torch.Tensor, targets: torch.Tensor, criterion: nn.Module, n_classes: int, ce_weight: float = 0.3, dice_weight: float = 0.7) -> Dict[str, torch.Tensor]:
     ce_loss = criterion(outputs, targets)
     probs = torch.softmax(outputs, dim=1)
     one_hot = F.one_hot(targets, num_classes=n_classes).permute(0, 4, 1, 2, 3).float()
     dice = dice_loss(probs, one_hot, multiclass=True)
-    loss = 0.5 * ce_loss + 0.5 * dice
+    # mimic reference: dice 更大权重
+    loss = ce_weight * ce_loss + dice_weight * dice
     return {"loss": loss, "ce_loss": ce_loss.detach(), "dice_loss": dice.detach()}
 
 
@@ -188,9 +204,26 @@ def main(args):
 
     train_loader, val_loader = prepare_dataloaders(args)
 
-    model = UNet3D(n_channels=4, n_classes=4, base_channels=32, bilinear=False).to(device)
+    model = UNet3D(n_channels=len(args.modalities), n_classes=4, base_channels=32, bilinear=False).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    criterion = nn.CrossEntropyLoss()
+    
+    # 加载类别权重（如果指定）
+    if args.class_weights:
+        print_weights_info(args.class_weights)
+        class_weights_tensor = load_class_weights(args.class_weights, args.weight_method, device=device)
+        if class_weights_tensor is not None:
+            criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
+            logging.info("✓ 使用加权CrossEntropyLoss，权重方法: %s", args.weight_method)
+        else:
+            # 如果加载失败，使用默认权重
+            class_weights = torch.tensor([0.25, 2.0, 1.5, 2.0], dtype=torch.float32, device=device)
+            criterion = nn.CrossEntropyLoss(weight=class_weights)
+            logging.info("使用默认类别权重: [0.25, 2.0, 1.5, 2.0]")
+    else:
+        # 使用默认权重（简单提升前景影响）
+        class_weights = torch.tensor([0.25, 2.0, 1.5, 2.0], dtype=torch.float32, device=device)
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        logging.info("使用默认类别权重: [0.25, 2.0, 1.5, 2.0]，建议使用 --class-weights 指定计算的权重")
     amp_enabled = args.amp and device.type == "cuda"
     if device.type == "cuda":
         scaler = GradScaler("cuda", enabled=amp_enabled)
